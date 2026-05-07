@@ -101,161 +101,111 @@ def main():
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
 
-    ###############
-    # Load datasets
-    ###############
-    raw_datasets = load_dataset(data_args.dataset_name)
-    logger.info(
-        f"Training on the following datasets and their proportions: {[split + ' : ' + str(dset.num_rows) for split, dset in raw_datasets.items()]}"
-    )
-    with training_args.main_process_first(desc="Log a few random samples from the raw training set"):
-        for index in random.sample(range(len(raw_datasets["train"])), 3):
-            logger.info(f"Sample {index} of the raw training set:\n\n{raw_datasets['train'][index]['messages']}")
-
-    #########################
-    # Apply dialogue template
-    #########################
-    dialogue_template = get_dialogue_template(data_args.dialogue_template)
-    logger.info(f"System prompt for dialogue template: {dialogue_template.system}")
-    raw_datasets = raw_datasets.map(prepare_dialogue, fn_kwargs={"dialogue_template": dialogue_template})
-
-    #####################################
-    # Load tokenizer and process datasets
-    #####################################
-    tokenizer = AutoTokenizer.from_pretrained(
+    #######################
+    # Load pretrained model
+    #######################
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+    model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
-        revision=model_args.model_revision,
+        torch_dtype=torch.float16 if training_args.fp16 else torch.float32,
+        use_cache=not training_args.gradient_checkpointing,
     )
 
-    # Note that we must call `add_tokens` before adding any special tokens
-    dialogue_tokens = dialogue_template.get_special_tokens()
-    num_added_tokens = tokenizer.add_special_tokens({"additional_special_tokens": dialogue_tokens})
-    logger.info(f"Added {num_added_tokens} new tokens: {dialogue_tokens}")
+    # Add pad token if missing
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
+    # Load dialogue template
+    dialogue_template = get_dialogue_template(data_args.dialogue_template)
+
+    # Resize embeddings if needed
+    embedding_size = model.get_input_embeddings().weight.shape[0]
+    if len(tokenizer) > embedding_size:
+        model.resize_token_embeddings(len(tokenizer))
+
+    if model_args.use_flash_attention_2:
+        from transformers import LlamaForCausalLM
+        if isinstance(model, LlamaForCausalLM):
+            from transformers.models.llama.modeling_llama import LlamaFlashAttention2
+            model.config._flash_attn_2_enabled = True
+
+    #######################
+    # Load and preprocess the dataset
+    #######################
+    raw_datasets = load_dataset(
+        data_args.dataset_name,
+        data_args.dataset_config_name,
+        cache_dir=model_args.cache_dir,
+        use_auth_token=True if model_args.use_auth_token else None,
+    )
+
+    # Preprocess datasets
     if training_args.do_train:
         column_names = list(raw_datasets["train"].features)
     else:
-        column_names = list(raw_datasets["test"].features)
-    text_column_name = "text" if "text" in column_names else column_names[0]
+        column_names = list(raw_datasets["validation"].features)
 
-    with training_args.main_process_first(desc="Log a few random samples from the training set"):
-        for index in random.sample(range(len(raw_datasets["train"])), 3):
-            logger.info(f"Sample {index} of the raw training set:\n\n{raw_datasets['train'][index]['text']}")
+    # Prepare dialogue function
+    def prepare_dialogue_text(examples):
+        dialogues = [prepare_dialogue(turns, dialogue_template) for turns in examples["turns"]]
+        return {"text": dialogues}
 
-    # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
-    tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
+    tokenized_datasets = raw_datasets.map(
+        prepare_dialogue_text,
+        remove_columns=column_names,
+        desc="Preparing dialogues",
+    )
 
+    # Tokenize function
     def tokenize_function(examples):
-        with CaptureLogger(tok_logger) as cl:
-            output = tokenizer(examples[text_column_name], return_token_type_ids=False)
-        # clm input could be much much longer than block_size
-        if "Token indices sequence length is longer than the" in cl.out:
-            tok_logger.warning(
-                "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
-                " before being passed to the model."
-            )
-        return output
+        model_inputs = tokenizer(
+            examples["text"],
+            max_length=data_args.max_seq_length,
+            truncation=True,
+            padding=False,
+        )
+        # Mask user labels
+        masked_labels = mask_user_labels(
+            model_inputs["input_ids"],
+            tokenizer,
+            dialogue_template,
+        )
+        model_inputs["labels"] = masked_labels
+        return model_inputs
 
     with training_args.main_process_first(desc="dataset map tokenization"):
-        tokenized_datasets = raw_datasets.map(
+        tokenized_datasets = tokenized_datasets.map(
             tokenize_function,
             batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-            desc="Running tokenizer on dataset",
-        )
-
-    ##############################
-    # Concatenate and chunk corpus
-    ##############################
-    if data_args.block_size is None:
-        block_size = tokenizer.model_max_length
-        if block_size > 1024:
-            logger.warning(
-                "The chosen tokenizer supports a `model_max_length` that is longer than the default `block_size` value"
-                " of 1024. If you would like to use a longer `block_size` up to `tokenizer.model_max_length` you can"
-                " override this default with `--block_size xxx`."
-            )
-            block_size = 1024
-    else:
-        if data_args.block_size > tokenizer.model_max_length:
-            logger.warning(
-                f"The block_size passed ({data_args.block_size}) is larger than the maximum length for the model"
-                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
-            )
-        block_size = min(data_args.block_size, tokenizer.model_max_length)
-
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
-    def group_texts(examples):
-        # Concatenate all texts.
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-        # customize this part to your needs.
-        if total_length >= block_size:
-            total_length = (total_length // block_size) * block_size
-        # Split by chunks of block_size.
-        result = {
-            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
-            for k, t in concatenated_examples.items()
-        }
-        result["labels"] = result["input_ids"].copy()
-        # Mask user labels in the loss so we only train on the assistant's turns
-        mask_user_labels(tokenizer, dialogue_template, result["labels"])
-        return result
-
-    with training_args.main_process_first(desc="grouping texts together"):
-        lm_datasets = tokenized_datasets.map(
-            group_texts,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            load_from_cache_file=not data_args.overwrite_cache,
-            desc=f"Grouping texts in chunks of {block_size}",
+            remove_columns=["text"],
+            desc="Tokenizing",
         )
 
     if training_args.do_train:
         if "train" not in tokenized_datasets:
             raise ValueError("--do_train requires a train dataset")
-        train_dataset = lm_datasets["train"]
+        train_dataset = tokenized_datasets["train"]
         if data_args.max_train_samples is not None:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
 
     if training_args.do_eval:
-        if "test" not in tokenized_datasets:
+        if "validation" not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = lm_datasets["test"]
+        eval_dataset = tokenized_datasets["validation"]
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
 
     #######################
-    # Load pretrained model
+    # Initialize Trainer
     #######################
-    logger.info("*** Load pretrained model ***")
-    torch_dtype = (
-        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        revision=model_args.model_revision,
-        torch_dtype=torch_dtype,
-        use_cache=False if training_args.gradient_checkpointing else True,
-    )
-    model.resize_token_embeddings(len(tokenizer))
-
-    ########################
-    # Initialize the Trainer
-    ########################
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        # Data collator defaults to DataCollatorWithPadding, so we change it
-        # since we've already chunked our corpus
         data_collator=default_data_collator,
     )
 
